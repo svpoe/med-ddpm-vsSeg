@@ -82,6 +82,7 @@ class NiftiPairImageGenerator(Dataset):
         target_files = sorted(glob(os.path.join(self.target_folder, '*')))
         pairs = []
         for input_file, target_file in zip(input_files, target_files):
+            print("input: ", input_file, ", target: ", target_file) # Added 
             assert int("".join(re.findall("\d", input_file))) == int("".join(re.findall("\d", target_file)))
             pairs.append((input_file, target_file))
         return pairs
