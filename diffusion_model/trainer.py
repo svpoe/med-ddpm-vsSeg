@@ -8,6 +8,7 @@ import copy
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from inspect import isfunction
 from functools import partial
 from torch.utils import data
@@ -25,14 +26,6 @@ import time
 import os
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
-
-try:
-    from apex import amp
-    APEX_AVAILABLE = True
-    print("APEX: ON")
-except:
-    APEX_AVAILABLE = False
-    print("APEX: OFF")
 
 def exists(x):
     return x is not None
@@ -54,13 +47,6 @@ def num_to_groups(num, divisor):
     if remainder > 0:
         arr.append(remainder)
     return arr
-
-def loss_backwards(fp16, loss, optimizer, **kwargs):
-    if fp16 and APEX_AVAILABLE:
-        with amp.scale_loss(loss, optimizer) as scaled_loss:
-            scaled_loss.backward(**kwargs)
-    else:
-        loss.backward(**kwargs)
 
 # small helper modules
 
@@ -325,7 +311,15 @@ class Trainer(object):
         self.train_num_steps = train_num_steps
 
         self.ds = dataset
-        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, num_workers=2, pin_memory=True))
+        # Optimize data loading for large volumes
+        self.dl = cycle(data.DataLoader(
+            self.ds, 
+            batch_size=train_batch_size, 
+            shuffle=True, 
+            num_workers=1,      # Reduced workers for memory efficiency
+            pin_memory=False,   # Disable pin_memory for large volumes
+            prefetch_factor=1   # Reduce prefetching
+        ))
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
         self.train_lr = train_lr
         self.train_batch_size = train_batch_size
@@ -333,16 +327,17 @@ class Trainer(object):
 
         self.step = 0
 
-        # Handle mixed precision training
-        if fp16 and not APEX_AVAILABLE:
-            print("⚠️  APEX not available, disabling fp16 training")
-            self.fp16 = False
-        else:
-            self.fp16 = fp16
-            
-        if self.fp16 and APEX_AVAILABLE:
-            (self.model, self.ema_model), self.opt = amp.initialize([self.model, self.ema_model], self.opt, opt_level='O1')
-            print("✅ Mixed precision training enabled with APEX")
+        # Handle mixed precision training with PyTorch's native AMP
+        self.fp16 = fp16
+        self.scaler = None
+        
+        if self.fp16:
+            if torch.cuda.is_available():
+                self.scaler = GradScaler()
+                print("✅ Mixed precision training enabled with PyTorch native AMP")
+            else:
+                print("⚠️  CUDA not available, disabling fp16 training")
+                self.fp16 = False
         
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
@@ -381,36 +376,70 @@ class Trainer(object):
         self.ema_model.load_state_dict(data['ema'])
 
     def train(self):
-        backwards = partial(loss_backwards, self.fp16)
         start_time = time.time()
 
         while self.step < self.train_num_steps:
             accumulated_loss = []
+            
+            # Zero gradients at the start of accumulation
+            self.opt.zero_grad()
+            
             for i in range(self.gradient_accumulate_every):
                 if self.with_condition:
                     data = next(self.dl)
-                    input_tensors = data['input'].cuda()
-                    target_tensors = data['target'].cuda()
-                    loss = self.model(target_tensors, condition_tensors=input_tensors)
+                    input_tensors = data['input'].to(device=next(self.model.parameters()).device, non_blocking=True)
+                    target_tensors = data['target'].to(device=next(self.model.parameters()).device, non_blocking=True)
+                    
+                    if self.fp16:
+                        # Use autocast for forward pass
+                        with autocast():
+                            loss = self.model(target_tensors, condition_tensors=input_tensors)
+                    else:
+                        loss = self.model(target_tensors, condition_tensors=input_tensors)
                 else:
-                    data = next(self.dl).cuda()
-                    loss = self.model(data)
-                loss = loss.sum()/self.batch_size
-                print(f'{self.step}: {loss.item()}')
-                backwards(loss / self.gradient_accumulate_every, self.opt)
-                accumulated_loss.append(loss.item())
+                    data = next(self.dl).to(device=next(self.model.parameters()).device, non_blocking=True)
+                    
+                    if self.fp16:
+                        # Use autocast for forward pass
+                        with autocast():
+                            loss = self.model(data)
+                    else:
+                        loss = self.model(data)
+                
+                loss = loss.sum() / self.batch_size
+                # Scale loss for gradient accumulation
+                loss = loss / self.gradient_accumulate_every
+                
+                print(f'{self.step}: {loss.item() * self.gradient_accumulate_every}')  # Show unscaled loss
+                
+                # Backward pass with mixed precision support
+                if self.fp16 and self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                    
+                accumulated_loss.append(loss.item() * self.gradient_accumulate_every)  # Store unscaled loss
 
-            # Record here
+            # Record average loss
             average_loss = np.mean(accumulated_loss)
-            end_time = time.time()
             self.writer.add_scalar("training_loss", average_loss, self.step)
 
-            self.opt.step()
-            self.opt.zero_grad()
+            # Optimizer step with mixed precision support
+            if self.fp16 and self.scaler is not None:
+                self.scaler.step(self.opt)
+                self.scaler.update()
+            else:
+                self.opt.step()
             
-            # Periodic memory cleanup to prevent accumulation
-            if self.step % 50 == 0 and torch.cuda.is_available():
+            # Aggressive memory cleanup for large volumes
+            if self.step % 10 == 0 and torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                
+            # Memory monitoring for debugging
+            if self.step % 100 == 0 and torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+                print(f'GPU Memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved')
 
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
@@ -419,21 +448,38 @@ class Trainer(object):
                 milestone = self.step // self.save_and_sample_every
                 batches = num_to_groups(1, self.batch_size)
 
-                if self.with_condition:
-                    all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n, condition_tensors=self.ds.sample_conditions(batch_size=n)), batches))
-                    all_images = torch.cat(all_images_list, dim=0)
-                else:
-                    all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
-                    all_images = torch.cat(all_images_list, dim=0)
+                # Clear cache before sampling to maximize available memory
+                torch.cuda.empty_cache()
+                
+                try:
+                    if self.with_condition:
+                        all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n, condition_tensors=self.ds.sample_conditions(batch_size=n)), batches))
+                        all_images = torch.cat(all_images_list, dim=0)
+                    else:
+                        all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
+                        all_images = torch.cat(all_images_list, dim=0)
 
-  
-                all_images = all_images.transpose(4, 2)
-                sampleImage = all_images.cpu().numpy()
-                sampleImage=sampleImage.reshape([self.image_size, self.image_size, self.depth_size])
-                nifti_img = nib.Nifti1Image(sampleImage, affine=np.eye(4))
-                nib.save(nifti_img, str(self.results_folder / f'sample-{milestone}.nii.gz'))
-               
-                self.save(milestone)
+      
+                    all_images = all_images.transpose(4, 2)
+                    sampleImage = all_images.cpu().numpy()
+                    sampleImage=sampleImage.reshape([self.image_size, self.image_size, self.depth_size])
+                    nifti_img = nib.Nifti1Image(sampleImage, affine=np.eye(4))
+                    nib.save(nifti_img, str(self.results_folder / f'sample-{milestone}.nii.gz'))
+                   
+                    self.save(milestone)
+                    
+                    # Clean up after sampling
+                    del all_images, all_images_list, sampleImage
+                    torch.cuda.empty_cache()
+                    
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"⚠️  Skipping sampling at step {self.step} due to memory constraints")
+                        torch.cuda.empty_cache()
+                        # Still save the model
+                        self.save(milestone)
+                    else:
+                        raise e
 
             self.step += 1
 
