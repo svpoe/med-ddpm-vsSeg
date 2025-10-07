@@ -1,0 +1,45 @@
+# Git and version control
+.git
+.gitignore
+.gitattributes
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large data, model, and result files
+# These should be handled via GCS, not included in the image
+dataset/
+model/
+results/
+logs/
+
+# Jupyter notebooks
+*.ipynb
+*.ipynb_checkpoints/
+
+# Documentation and local scripts
+README.md
+LICENSE
+images/
+scripts/
+
+# Large reference files
+reference_brats.nii.gz
