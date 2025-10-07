@@ -56,7 +56,7 @@ def num_to_groups(num, divisor):
     return arr
 
 def loss_backwards(fp16, loss, optimizer, **kwargs):
-    if fp16:
+    if fp16 and APEX_AVAILABLE:
         with amp.scale_loss(loss, optimizer) as scaled_loss:
             scaled_loss.backward(**kwargs)
     else:
@@ -325,7 +325,7 @@ class Trainer(object):
         self.train_num_steps = train_num_steps
 
         self.ds = dataset
-        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, num_workers=4, pin_memory=True))
+        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, num_workers=2, pin_memory=True))
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
         self.train_lr = train_lr
         self.train_batch_size = train_batch_size
@@ -333,10 +333,16 @@ class Trainer(object):
 
         self.step = 0
 
-        # assert not fp16 or fp16 and APEX_AVAILABLE, 'Apex must be installed in order for mixed precision training to be turned on'
-        self.fp16 = fp16
-        if fp16:
+        # Handle mixed precision training
+        if fp16 and not APEX_AVAILABLE:
+            print("⚠️  APEX not available, disabling fp16 training")
+            self.fp16 = False
+        else:
+            self.fp16 = fp16
+            
+        if self.fp16 and APEX_AVAILABLE:
             (self.model, self.ema_model), self.opt = amp.initialize([self.model, self.ema_model], self.opt, opt_level='O1')
+            print("✅ Mixed precision training enabled with APEX")
         
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
@@ -401,6 +407,10 @@ class Trainer(object):
 
             self.opt.step()
             self.opt.zero_grad()
+            
+            # Periodic memory cleanup to prevent accumulation
+            if self.step % 50 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
