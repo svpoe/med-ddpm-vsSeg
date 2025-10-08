@@ -1,15 +1,41 @@
 #-*- coding:utf-8 -*-
 # +
 from torchvision.transforms import RandomCrop, Compose, ToPILImage, Resize, ToTensor, Lambda
-from diffusion_model.trainer import GaussianDiffusion, Trainer, num_to_groups
+from diffusion_model.trainer import GaussianDiffusion, Trainer
 from diffusion_model.unet import create_model
 from dataset import NiftiPairImageGenerator
 import argparse
 import torch
 from google.cloud import storage
-import time
-import numpy as np
-import nibabel as nib
+import traceback
+import os
+import json
+
+# Test GCS access early
+def test_gcs_access(bucket_name):
+    """Test if we can access the GCS bucket"""
+    try:
+        print(f"🔍 Testing GCS access to bucket: {bucket_name}")
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        
+        # Try to list some objects to verify access
+        blobs = list(bucket.list_blobs(max_results=1))
+        print(f"✅ Successfully connected to GCS bucket: {bucket_name}")
+        
+        # Test upload permissions by creating a small test file
+        test_blob = bucket.blob("models/checkpoints/.access_test")
+        test_blob.upload_from_string("access test")
+        print(f"✅ Successfully tested upload to gs://{bucket_name}/models/checkpoints/")
+        
+        # Clean up test file
+        test_blob.delete()
+        return True
+    except Exception as e:
+        print(f"❌ GCS access test failed: {e}")
+        print(f"❌ Error type: {type(e).__name__}")
+        traceback.print_exc()
+        return False
 
 import os 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID" 
@@ -59,48 +85,44 @@ def download_from_gcs(bucket_name, gcs_path, dest_path):
         blob.download_to_filename(dest_path)
         print(f"  Downloaded {gcs_path}")
 
-def upload_to_gcs(bucket_name, local_path, gcs_path):
+def upload_to_gcs(bucket_name, gcs_path, dest_path):
     """Upload files to Google Cloud Storage"""
     try:
-        if not os.path.exists(local_path):
-            print(f"⚠️  Local file not found: {local_path}")
-            return False
-            
         client = storage.Client()
         bucket = client.bucket(bucket_name)
-        blob = bucket.blob(gcs_path)
+        blob = bucket.blob(dest_path)
+        blob.upload_from_filename(gcs_path)
+        print(f"Uploaded {gcs_path} to gs://{bucket_name}/{dest_path}")
+    except Exception as e:
+        print(f"Failed to upload {gcs_path}: {e}")
+
+def upload_checkpoint_to_gcs(bucket_name, local_checkpoint_path, milestone):
+    """Upload model checkpoint to GCS bucket in the checkpoints folder"""
+    try:
+        print(f"🚀 Initializing GCS client for upload...")
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
         
-        print(f"📤 Uploading {local_path} to gs://{bucket_name}/{gcs_path}")
-        blob.upload_from_filename(local_path)
-        print(f"✅ Successfully uploaded {local_path}")
+        # Create checkpoint filename with milestone
+        checkpoint_filename = f"model-{milestone}.pt"
+        gcs_path = f"models/checkpoints/{checkpoint_filename}"
+        
+        print(f"📤 Uploading {local_checkpoint_path} to gs://{bucket_name}/{gcs_path}")
+        
+        # Get file size for progress info
+        file_size = os.path.getsize(local_checkpoint_path)
+        print(f"📏 File size: {file_size / (1024*1024):.2f} MB")
+        
+        blob = bucket.blob(gcs_path)
+        blob.upload_from_filename(local_checkpoint_path)
+        print(f"✅ Successfully uploaded checkpoint to gs://{bucket_name}/{gcs_path}")
         return True
     except Exception as e:
-        print(f"❌ Failed to upload {local_path}: {e}")
+        print(f"❌ Failed to upload checkpoint {local_checkpoint_path}: {str(e)}")
+        print(f"❌ Error type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
         return False
-
-def upload_results_to_gcs(bucket_name, output_path, results_folder='./results'):
-    """Upload all results to GCS with better error handling"""
-    if not os.path.exists(results_folder):
-        print(f"⚠️  Results directory not found: {results_folder}")
-        return
-        
-    upload_count = 0
-    failed_count = 0
-    
-    print(f"📤 Starting upload from {results_folder} to gs://{bucket_name}/{output_path}")
-    
-    for root, dirs, files in os.walk(results_folder):
-        for file in files:
-            local_path = os.path.join(root, file)
-            relative_path = os.path.relpath(local_path, results_folder)
-            gcs_path = f"{output_path}results/{relative_path}"
-            
-            if upload_to_gcs(bucket_name, local_path, gcs_path):
-                upload_count += 1
-            else:
-                failed_count += 1
-    
-    print(f"📊 Upload summary: {upload_count} successful, {failed_count} failed")
 
 
 
@@ -127,6 +149,14 @@ parser.add_argument('--save_and_sample_every', type=int, default=1000)
 parser.add_argument('--with_condition', action='store_true')
 parser.add_argument('-r', '--resume_weight', type=str, default="") # default="model/model_128.pt")
 args = parser.parse_args()
+
+# Test GCS access immediately
+print("🔍 Testing GCS access before starting training...")
+gcs_access_ok = test_gcs_access(args.bucket_name)
+if not gcs_access_ok:
+    print("❌ GCS access test failed! Training will continue but uploads may not work.")
+else:
+    print("✅ GCS access confirmed!")
 
 inputfolder = args.inputfolder
 targetfolder = args.targetfolder
@@ -240,6 +270,168 @@ if local_model_path and os.path.exists(local_model_path):
 else:
     print("⚠️  No checkpoint provided, initializing model with random weights")
 
+class CloudTrainer(Trainer):
+    """Enhanced Trainer that uploads checkpoints to Google Cloud Storage"""
+    
+    def __init__(self, *args, bucket_name=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bucket_name = bucket_name
+        print(f"🔧 CloudTrainer initialized with bucket: {bucket_name}")
+        print(f"🔧 Save frequency: every {self.save_and_sample_every} steps")
+        
+    def train(self):
+        """Override train method to add save debugging and checkpoint-only saves"""
+        print(f"🚀 Starting training loop for {self.train_num_steps} steps...")
+        print(f"📋 Will save checkpoints at steps: {[i for i in range(self.save_and_sample_every, self.train_num_steps + 1, self.save_and_sample_every)]}")
+        
+        # Custom training loop with checkpoint-only saves
+        while self.step < self.train_num_steps:
+            accumulated_loss = []
+            
+            for i in range(self.gradient_accumulate_every):
+                if self.with_condition:
+                    data = next(self.dl)
+                    input_tensors = data['input'].cuda()
+                    target_tensors = data['target'].cuda()
+                    loss = self.model(target_tensors, condition_tensors=input_tensors)
+                else:
+                    data = next(self.dl).cuda()
+                    loss = self.model(data)
+                
+                loss = loss.sum() / self.batch_size
+                print(f'{self.step}: {loss.item()}')
+                loss.backward()
+                accumulated_loss.append(loss.item())
+
+            average_loss = sum(accumulated_loss) / len(accumulated_loss)
+            self.writer.add_scalar("training_loss", average_loss, self.step)
+
+            self.opt.step()
+            self.opt.zero_grad()
+
+            if self.step % self.update_ema_every == 0:
+                self.step_ema()
+
+            # Save checkpoint (without sampling) every few steps
+            if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                print(f"🔄 Checkpoint save triggered at step {self.step}")
+                milestone = self.step // self.save_and_sample_every
+                
+                # Save model checkpoint only (skip sampling to avoid memory issues)
+                self.save_checkpoint_only(milestone)
+                
+                # Do sampling less frequently to avoid memory issues
+                if milestone % 2 == 0:  # Sample every other checkpoint
+                    try:
+                        print(f"🎨 Attempting sampling at milestone {milestone}")
+                        self.do_sampling(milestone)
+                    except Exception as e:
+                        print(f"⚠️ Sampling failed at milestone {milestone}: {e}")
+
+            self.step += 1
+
+        print('training completed')
+        
+    def save_checkpoint_only(self, milestone):
+        """Save model checkpoint without sampling"""
+        print(f"💾 Saving checkpoint-only at milestone {milestone}")
+        
+        # Create data dict manually (similar to parent save method)
+        data = {
+            'step': self.step,
+            'model': self.model.state_dict(),
+            'ema': self.ema_model.state_dict(),
+            'opt': self.opt.state_dict(),
+        }
+        
+        # Only add scaler if it exists (fp16 is enabled)
+        if self.scaler is not None:
+            data['scaler'] = self.scaler.state_dict()
+        
+        # Save to results folder
+        checkpoint_path = str(self.results_folder / f'model-{milestone}.pt')
+        torch.save(data, checkpoint_path)
+        print(f"💾 Checkpoint saved to: {checkpoint_path}")
+        
+        # Upload to GCS
+        self.upload_checkpoint(checkpoint_path, milestone)
+        
+    def do_sampling(self, milestone):
+        """Do sampling and save sample (separated from checkpoint saving)"""
+        from diffusion_model.trainer import num_to_groups
+        import nibabel as nib
+        import numpy as np
+        
+        print(f"🎨 Generating sample at milestone {milestone}")
+        batches = num_to_groups(1, self.batch_size)
+        
+        torch.cuda.empty_cache()  # Clear cache before sampling
+        
+        if self.with_condition:
+            all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n, condition_tensors=self.ds.sample_conditions(batch_size=n)), batches))
+            all_images = torch.cat(all_images_list, dim=0)
+        else:
+            all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
+            all_images = torch.cat(all_images_list, dim=0)
+
+        all_images = all_images.transpose(4, 2)
+        sampleImage = all_images.cpu().numpy()
+        sampleImage = sampleImage.reshape([self.image_size, self.image_size, self.depth_size])
+        nifti_img = nib.Nifti1Image(sampleImage, affine=np.eye(4))
+        nib.save(nifti_img, str(self.results_folder / f'sample-{milestone}.nii.gz'))
+        print(f"🎨 Sample saved to: sample-{milestone}.nii.gz")
+        
+    def upload_checkpoint(self, checkpoint_path, milestone):
+        """Upload checkpoint to GCS and AIP_MODEL_DIR"""
+        # Also save to AIP_MODEL_DIR if available (for Vertex AI compliance)
+        aip_model_dir = os.environ.get('AIP_MODEL_DIR')
+        if aip_model_dir:
+            print(f"📁 AIP_MODEL_DIR detected: {aip_model_dir}")
+            os.makedirs(aip_model_dir, exist_ok=True)
+            
+            aip_checkpoint_path = os.path.join(aip_model_dir, f'model-{milestone}.pt')
+            try:
+                import shutil
+                shutil.copy2(checkpoint_path, aip_checkpoint_path)
+                print(f"📋 Copied checkpoint to AIP_MODEL_DIR: {aip_checkpoint_path}")
+                
+                # Also copy the latest checkpoint as "model.pt" for Vertex AI
+                latest_model_path = os.path.join(aip_model_dir, 'model.pt')
+                shutil.copy2(checkpoint_path, latest_model_path)
+                print(f"📋 Saved latest model as: {latest_model_path}")
+            except Exception as e:
+                print(f"⚠️ Failed to copy to AIP_MODEL_DIR: {e}")
+        
+        # Upload checkpoint to GCS if bucket name is provided
+        if self.bucket_name:
+            print(f"📁 Looking for checkpoint at: {checkpoint_path}")
+            
+            # Check if file exists before trying to upload
+            if os.path.exists(checkpoint_path):
+                print(f"🔄 Uploading checkpoint {milestone} to GCS...")
+                success = upload_checkpoint_to_gcs(self.bucket_name, checkpoint_path, milestone)
+                if success:
+                    print(f"✅ Checkpoint {milestone} uploaded successfully to gs://{self.bucket_name}/models/checkpoints/")
+                else:
+                    print(f"❌ Failed to upload checkpoint {milestone}")
+            else:
+                print(f"⚠️ Checkpoint file not found: {checkpoint_path}")
+        else:
+            print("⚠️ No bucket name provided, skipping GCS upload")
+        
+    def save(self, milestone):
+        """Override save method to include GCS upload and AIP_MODEL_DIR save"""
+        print(f"💾 Saving checkpoint at milestone {milestone}")
+        
+        # Call the original save method (saves to results folder)
+        super().save(milestone)
+        
+        # Get the path to the saved checkpoint
+        checkpoint_path = str(self.results_folder / f'model-{milestone}.pt')
+        
+        # Upload using our upload method
+        self.upload_checkpoint(checkpoint_path, milestone)
+
 # Clear cache before training starts and set memory optimizations
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
@@ -248,43 +440,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = False
     print(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB total") 
 
-# Simple periodic upload function 
-def periodic_upload_check(bucket_name, output_path, current_step, last_upload_step, upload_every=1000):
-    """Check if it's time to upload and do so if needed"""
-    if current_step > 0 and (current_step - last_upload_step) >= upload_every:
-        print(f"📤 Periodic upload at step {current_step}")
-        try:
-            upload_results_to_gcs(bucket_name, output_path)
-            return current_step  # Return new last_upload_step
-        except Exception as e:
-            print(f"❌ Upload failed at step {current_step}: {e}")
-            return last_upload_step  # Keep old value on failure
-    return last_upload_step
-
-# Monkey patch the Trainer.save method to include uploads
-original_save = Trainer.save
-
-def enhanced_save(self, milestone):
-    """Enhanced save method that uploads to GCS after saving"""
-    # Call original save
-    result = original_save(self, milestone)
-    
-    # Upload if we have bucket info
-    if hasattr(self, '_bucket_name') and hasattr(self, '_output_path'):
-        print(f"🔄 Uploading checkpoint at milestone {milestone}")
-        try:
-            upload_results_to_gcs(self._bucket_name, self._output_path)
-            print(f"✅ Successfully uploaded checkpoint at milestone {milestone}")
-        except Exception as e:
-            print(f"❌ Failed to upload checkpoint at milestone {milestone}: {e}")
-    
-    return result
-
-# Apply the monkey patch
-Trainer.save = enhanced_save
-
-# Use regular trainer but add GCS info
-trainer = Trainer(
+trainer = CloudTrainer(
     diffusion,
     dataset,
     image_size = input_size,
@@ -297,17 +453,62 @@ trainer = Trainer(
     fp16 = False,                     # Temporarily disable mixed precision to fix type mismatch
     with_condition=with_condition,
     save_and_sample_every = save_and_sample_every,
+    bucket_name=args.bucket_name,     # Add bucket name for GCS uploads
 )
 
-# Add GCS info to trainer for automatic uploads
-trainer._bucket_name = args.bucket_name
-trainer._output_path = args.output_path
-
-
-print(f"Training for {args.epochs} epochs with batch size {args.batchsize}")
+print(f"🚀 Starting training with {args.epochs} epochs, batch size {args.batchsize}")
+print(f"💾 Model checkpoints will be saved every {save_and_sample_every} steps to gs://{args.bucket_name}/models/checkpoints/")
 trainer.train()
 
-print("🎯 Training completed! Uploading results to GCS...")
-# Upload results to GCS with improved error handling
+print("🎯 Training completed! Saving final model...")
+# Force save the final model
+final_step = trainer.step
+final_milestone = max(1, final_step // save_and_sample_every)
+print(f"🔄 Force saving final model at step {final_step} as milestone {final_milestone}")
+trainer.save(final_milestone)
+
+print("🎯 Uploading final results to GCS...")
+
+# Upload results to GCS including model checkpoints
+def upload_results_to_gcs(bucket_name, output_path):
+    """Upload all training results to GCS"""
+    uploaded_count = 0
+    
+    # Upload results directory
+    if os.path.exists('./results'):
+        print("📤 Uploading results...")
+        for root, dirs, files in os.walk('./results'):
+            for file in files:
+                local_path = os.path.join(root, file)
+                relative_path = os.path.relpath(local_path, './results')
+                gcs_path = f"{output_path}results/{relative_path}"
+                
+                try:
+                    upload_to_gcs(bucket_name, local_path, gcs_path)
+                    uploaded_count += 1
+                except Exception as e:
+                    print(f"❌ Failed to upload {local_path}: {e}")
+        
+        print(f"✅ Uploaded {uploaded_count} result files")
+    else:
+        print("⚠️  No results directory found")
+    
+    # Upload any remaining model checkpoints that might not have been uploaded during training
+    model_dir = './results'  # Trainer saves models in results folder
+    if os.path.exists(model_dir):
+        print("📤 Uploading any remaining model checkpoints...")
+        for file in os.listdir(model_dir):
+            if file.startswith('model-') and file.endswith('.pt'):
+                local_path = os.path.join(model_dir, file)
+                # Extract milestone from filename
+                try:
+                    milestone = file.replace('model-', '').replace('.pt', '')
+                    success = upload_checkpoint_to_gcs(bucket_name, local_path, milestone)
+                    if success:
+                        uploaded_count += 1
+                except Exception as e:
+                    print(f"❌ Failed to upload checkpoint {file}: {e}")
+
+# Upload all results
 upload_results_to_gcs(args.bucket_name, args.output_path)
-print("✅ Upload process completed!")
+print(f"✅ Upload process completed! Check gs://{args.bucket_name}/models/checkpoints/ for model weights.")
