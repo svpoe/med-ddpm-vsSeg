@@ -1,12 +1,15 @@
 #-*- coding:utf-8 -*-
 # +
 from torchvision.transforms import RandomCrop, Compose, ToPILImage, Resize, ToTensor, Lambda
-from diffusion_model.trainer import GaussianDiffusion, Trainer
+from diffusion_model.trainer import GaussianDiffusion, Trainer, num_to_groups
 from diffusion_model.unet import create_model
 from dataset import NiftiPairImageGenerator
 import argparse
 import torch
 from google.cloud import storage
+import time
+import numpy as np
+import nibabel as nib
 
 import os 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID" 
@@ -56,16 +59,48 @@ def download_from_gcs(bucket_name, gcs_path, dest_path):
         blob.download_to_filename(dest_path)
         print(f"  Downloaded {gcs_path}")
 
-def upload_to_gcs(bucket_name, gcs_path, dest_path):
+def upload_to_gcs(bucket_name, local_path, gcs_path):
     """Upload files to Google Cloud Storage"""
     try:
+        if not os.path.exists(local_path):
+            print(f"⚠️  Local file not found: {local_path}")
+            return False
+            
         client = storage.Client()
         bucket = client.bucket(bucket_name)
-        blob = bucket.blob(dest_path)
-        blob.upload_from_filename(gcs_path)
-        print(f"Uploaded {gcs_path} to gs://{bucket_name}/{dest_path}")
+        blob = bucket.blob(gcs_path)
+        
+        print(f"📤 Uploading {local_path} to gs://{bucket_name}/{gcs_path}")
+        blob.upload_from_filename(local_path)
+        print(f"✅ Successfully uploaded {local_path}")
+        return True
     except Exception as e:
-        print(f"Failed to upload {gcs_path}: {e}")
+        print(f"❌ Failed to upload {local_path}: {e}")
+        return False
+
+def upload_results_to_gcs(bucket_name, output_path, results_folder='./results'):
+    """Upload all results to GCS with better error handling"""
+    if not os.path.exists(results_folder):
+        print(f"⚠️  Results directory not found: {results_folder}")
+        return
+        
+    upload_count = 0
+    failed_count = 0
+    
+    print(f"📤 Starting upload from {results_folder} to gs://{bucket_name}/{output_path}")
+    
+    for root, dirs, files in os.walk(results_folder):
+        for file in files:
+            local_path = os.path.join(root, file)
+            relative_path = os.path.relpath(local_path, results_folder)
+            gcs_path = f"{output_path}results/{relative_path}"
+            
+            if upload_to_gcs(bucket_name, local_path, gcs_path):
+                upload_count += 1
+            else:
+                failed_count += 1
+    
+    print(f"📊 Upload summary: {upload_count} successful, {failed_count} failed")
 
 
 
@@ -213,6 +248,42 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = False
     print(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB total") 
 
+# Simple periodic upload function 
+def periodic_upload_check(bucket_name, output_path, current_step, last_upload_step, upload_every=1000):
+    """Check if it's time to upload and do so if needed"""
+    if current_step > 0 and (current_step - last_upload_step) >= upload_every:
+        print(f"📤 Periodic upload at step {current_step}")
+        try:
+            upload_results_to_gcs(bucket_name, output_path)
+            return current_step  # Return new last_upload_step
+        except Exception as e:
+            print(f"❌ Upload failed at step {current_step}: {e}")
+            return last_upload_step  # Keep old value on failure
+    return last_upload_step
+
+# Monkey patch the Trainer.save method to include uploads
+original_save = Trainer.save
+
+def enhanced_save(self, milestone):
+    """Enhanced save method that uploads to GCS after saving"""
+    # Call original save
+    result = original_save(self, milestone)
+    
+    # Upload if we have bucket info
+    if hasattr(self, '_bucket_name') and hasattr(self, '_output_path'):
+        print(f"🔄 Uploading checkpoint at milestone {milestone}")
+        try:
+            upload_results_to_gcs(self._bucket_name, self._output_path)
+            print(f"✅ Successfully uploaded checkpoint at milestone {milestone}")
+        except Exception as e:
+            print(f"❌ Failed to upload checkpoint at milestone {milestone}: {e}")
+    
+    return result
+
+# Apply the monkey patch
+Trainer.save = enhanced_save
+
+# Use regular trainer but add GCS info
 trainer = Trainer(
     diffusion,
     dataset,
@@ -228,17 +299,15 @@ trainer = Trainer(
     save_and_sample_every = save_and_sample_every,
 )
 
+# Add GCS info to trainer for automatic uploads
+trainer._bucket_name = args.bucket_name
+trainer._output_path = args.output_path
+
 
 print(f"Training for {args.epochs} epochs with batch size {args.batchsize}")
 trainer.train()
 
- # Upload results to GCS
-if os.path.exists('./results'):
-    for root, dirs, files in os.walk('./results'):
-        for file in files:
-            local_path = os.path.join(root, file)
-            relative_path = os.path.relpath(local_path, './results')
-            gcs_path = f"{args.output_path}results/{relative_path}"
-            upload_to_gcs(args.bucket_name, local_path, gcs_path)
-else:
-    print("⚠️  No results directory found")
+print("🎯 Training completed! Uploading results to GCS...")
+# Upload results to GCS with improved error handling
+upload_results_to_gcs(args.bucket_name, args.output_path)
+print("✅ Upload process completed!")

@@ -294,7 +294,8 @@ class Trainer(object):
         save_and_sample_every = 1000,
         results_folder = './results',
         with_condition = False,
-        with_pairwised = False):
+        with_pairwised = False,
+        early_stopping_patience = 10000):
         super().__init__()
         self.model = diffusion_model
         self.ema = EMA(ema_decay)
@@ -303,6 +304,11 @@ class Trainer(object):
 
         self.step_start_ema = step_start_ema
         self.save_and_sample_every = save_and_sample_every
+        
+        # Enhanced checkpoint management
+        self.best_loss = float('inf')
+        self.steps_without_improvement = 0
+        self.early_stopping_patience = early_stopping_patience
 
         self.batch_size = train_batch_size
         self.image_size = diffusion_model.image_size
@@ -360,13 +366,33 @@ class Trainer(object):
             return
         self.ema.update_model_average(self.ema_model, self.model)
 
-    def save(self, milestone):
+    def save(self, milestone, is_best=False, is_latest=False):
         data = {
             'step': self.step,
             'model': self.model.state_dict(),
-            'ema': self.ema_model.state_dict()
+            'ema': self.ema_model.state_dict(),
+            'optimizer': self.opt.state_dict(),  # Save optimizer state for resuming
+            'train_lr': self.train_lr,
+            'image_size': self.image_size,
+            'depth_size': self.depth_size
         }
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        
+        # Save milestone checkpoint
+        checkpoint_path = str(self.results_folder / f'model-{milestone}.pt')
+        torch.save(data, checkpoint_path)
+        print(f"💾 Saved checkpoint: model-{milestone}.pt (step {self.step})")
+        
+        # Save latest checkpoint (for easy resuming)
+        if is_latest:
+            latest_path = str(self.results_folder / 'model-latest.pt')
+            torch.save(data, latest_path)
+            print(f"💾 Saved latest checkpoint: model-latest.pt")
+            
+        # Save best checkpoint (for early stopping)
+        if is_best:
+            best_path = str(self.results_folder / 'model-best.pt')
+            torch.save(data, best_path)
+            print(f"🏆 Saved best checkpoint: model-best.pt (step {self.step})")
 
     def load(self, milestone):
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
@@ -420,9 +446,18 @@ class Trainer(object):
                     
                 accumulated_loss.append(loss.item() * self.gradient_accumulate_every)  # Store unscaled loss
 
-            # Record average loss
+            # Record average loss and check for improvement
             average_loss = np.mean(accumulated_loss)
             self.writer.add_scalar("training_loss", average_loss, self.step)
+            
+            # Track best loss for early stopping
+            is_best = average_loss < self.best_loss
+            if is_best:
+                self.best_loss = average_loss
+                self.steps_without_improvement = 0
+                print(f"🎯 New best loss: {average_loss:.6f} at step {self.step}")
+            else:
+                self.steps_without_improvement += 1
 
             # Optimizer step with mixed precision support
             if self.fp16 and self.scaler is not None:
@@ -466,7 +501,8 @@ class Trainer(object):
                     nifti_img = nib.Nifti1Image(sampleImage, affine=np.eye(4))
                     nib.save(nifti_img, str(self.results_folder / f'sample-{milestone}.nii.gz'))
                    
-                    self.save(milestone)
+                    # Enhanced checkpoint saving
+                    self.save(milestone, is_best=is_best, is_latest=True)
                     
                     # Clean up after sampling
                     del all_images, all_images_list, sampleImage
@@ -476,10 +512,19 @@ class Trainer(object):
                     if "out of memory" in str(e):
                         print(f"⚠️  Skipping sampling at step {self.step} due to memory constraints")
                         torch.cuda.empty_cache()
-                        # Still save the model
-                        self.save(milestone)
+                        # Still save the model even if sampling fails
+                        self.save(milestone, is_best=is_best, is_latest=True)
                     else:
                         raise e
+            
+            # Check for early stopping
+            if self.steps_without_improvement >= self.early_stopping_patience:
+                print(f"🛑 Early stopping triggered! No improvement for {self.early_stopping_patience} steps.")
+                print(f"   Best loss: {self.best_loss:.6f}")
+                print(f"   Saving final checkpoint...")
+                final_milestone = self.step // self.save_and_sample_every + 1
+                self.save(final_milestone, is_best=False, is_latest=True)
+                break
 
             self.step += 1
 
