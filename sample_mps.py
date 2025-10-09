@@ -139,7 +139,9 @@ for k, inputfile in enumerate(mask_list):
             counter = counter + 1
             sampleImage = sampleImages[b][0]
             sampleImage = sampleImage.numpy()
-            sampleImage=sampleImage.reshape(refImg.shape)
+            #sampleImage=sampleImage.reshape(input_size,input_size,depth_size)
+            # Reshape to the model's output dimensions (not reference image dimensions)
+            sampleImage = sampleImage.reshape(input_size, input_size, depth_size)
             nifti_img = nib.Nifti1Image(sampleImage, affine=ref.affine)
             nib.save(nifti_img, os.path.join(img_dir, f'{counter}_{msk_name}'))
             nib.save(ref, os.path.join(msk_dir, f'{counter}_{msk_name}'))

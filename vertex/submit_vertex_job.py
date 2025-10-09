@@ -32,7 +32,7 @@ def submit_training_job():
         "--bucket_name", args.bucket_name,
         "--epochs", str(args.epochs),
         "--with_condition",
-        "--save_and_sample_every", "500",
+        "--save_and_sample_every", str(args.save_and_sample_every),  # Use the actual argument value
         "--input_size", "256",          # Reduced for memory efficiency
         "--depth_size", "64",           # Reduced for memory efficiency
         "--num_channels", "32",         # Reduced for memory efficiency
